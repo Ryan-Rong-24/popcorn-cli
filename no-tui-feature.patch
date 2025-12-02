@@ -1,0 +1,301 @@
+diff --git a/src/cmd/mod.rs b/src/cmd/mod.rs
+index 2ff54f8..9de3637 100644
+--- a/src/cmd/mod.rs
++++ b/src/cmd/mod.rs
+@@ -59,6 +59,10 @@ pub struct Cli {
+     // Optional: Specify output file
+     #[arg(short, long)]
+     pub output: Option<String>,
++
++    /// Skip the TUI and print results directly to stdout
++    #[arg(long)]
++    pub no_tui: bool,
+ }
+ 
+ #[derive(Subcommand, Debug)]
+@@ -96,6 +100,10 @@ enum Commands {
+         // Optional: Specify output file
+         #[arg(short, long)]
+         output: Option<String>,
++
++        /// Skip the TUI and print results directly to stdout
++        #[arg(long)]
++        no_tui: bool,
+     },
+ }
+ 
+@@ -121,6 +129,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
+             leaderboard,
+             mode,
+             output,
++            no_tui,
+         }) => {
+             let config = load_config()?;
+             let cli_id = config.cli_id.ok_or_else(|| {
+@@ -133,15 +142,28 @@ pub async fn execute(cli: Cli) -> Result<()> {
+ 
+             // Use filepath from Submit command first, fallback to top-level filepath
+             let final_filepath = filepath.or(cli.filepath);
+-            submit::run_submit_tui(
+-                final_filepath, // Resolved filepath
+-                gpu,            // From Submit command
+-                leaderboard,    // From Submit command
+-                mode,           // From Submit command
+-                cli_id,
+-                output, // From Submit command
+-            )
+-            .await
++            
++            if no_tui {
++                submit::run_submit_plain(
++                    final_filepath, // Resolved filepath
++                    gpu,            // From Submit command
++                    leaderboard,    // From Submit command
++                    mode,           // From Submit command
++                    cli_id,
++                    output, // From Submit command
++                )
++                .await
++            } else {
++                submit::run_submit_tui(
++                    final_filepath, // Resolved filepath
++                    gpu,            // From Submit command
++                    leaderboard,    // From Submit command
++                    mode,           // From Submit command
++                    cli_id,
++                    output, // From Submit command
++                )
++                .await
++            }
+         }
+         None => {
+             // Check if any of the submission-related flags were used at the top level
+diff --git a/src/cmd/submit.rs b/src/cmd/submit.rs
+index 9c593ee..87face5 100644
+--- a/src/cmd/submit.rs
++++ b/src/cmd/submit.rs
+@@ -301,8 +301,16 @@ impl App {
+         file.read_to_string(&mut file_content)?;
+ 
+         self.submission_task = Some(tokio::spawn(async move {
+-            service::submit_solution(&client, &filepath, &file_content, &leaderboard, &gpu, &mode)
+-                .await
++            service::submit_solution(
++                &client,
++                &filepath,
++                &file_content,
++                &leaderboard,
++                &gpu,
++                &mode,
++                None,
++            )
++            .await
+         }));
+         Ok(())
+     }
+@@ -672,3 +680,110 @@ pub async fn run_submit_tui(
+ 
+     Ok(())
+ }
++
++pub async fn run_submit_plain(
++    filepath: Option<String>,
++    gpu: Option<String>,
++    leaderboard: Option<String>,
++    mode: Option<String>,
++    cli_id: String,
++    output: Option<String>,
++) -> Result<()> {
++    let file_to_submit = match filepath {
++        Some(fp) => fp,
++        None => {
++            return Err(anyhow!("File path is required when using --no-tui"));
++        }
++    };
++
++    if !Path::new(&file_to_submit).exists() {
++        return Err(anyhow!("File not found: {}", file_to_submit));
++    }
++
++    let (directives, has_multiple_gpus) = utils::get_popcorn_directives(&file_to_submit)?;
++
++    if has_multiple_gpus {
++        return Err(anyhow!(
++            "Multiple GPUs are not supported yet. Please specify only one GPU."
++        ));
++    }
++
++    // Determine final values
++    let final_gpu = gpu
++        .or_else(|| {
++            if !directives.gpus.is_empty() {
++                Some(directives.gpus[0].clone())
++            } else {
++                None
++            }
++        })
++        .ok_or_else(|| anyhow!("GPU not specified. Use --gpu flag or add GPU directive to file"))?;
++
++    let final_leaderboard = leaderboard
++        .or_else(|| {
++            if !directives.leaderboard_name.is_empty() {
++                Some(directives.leaderboard_name.clone())
++            } else {
++                None
++            }
++        })
++        .ok_or_else(|| {
++            anyhow!("Leaderboard not specified. Use --leaderboard flag or add leaderboard directive to file")
++        })?;
++
++    let final_mode = mode.ok_or_else(|| {
++        anyhow!("Submission mode not specified. Use --mode flag (test, benchmark, leaderboard, profile)")
++    })?;
++
++    // Read file content
++    let mut file = File::open(&file_to_submit)?;
++    let mut file_content = String::new();
++    file.read_to_string(&mut file_content)?;
++
++    eprintln!("Submitting to leaderboard: {}", final_leaderboard);
++    eprintln!("GPU: {}", final_gpu);
++    eprintln!("Mode: {}", final_mode);
++    eprintln!("File: {}", file_to_submit);
++    eprintln!("\nWaiting for results...");
++
++    // Create client and submit
++    let client = service::create_client(Some(cli_id))?;
++    let result = service::submit_solution(
++        &client,
++        &file_to_submit,
++        &file_content,
++        &final_leaderboard,
++        &final_gpu,
++        &final_mode,
++        Some(Box::new(|msg| {
++            eprintln!("{}", msg);
++        })),
++    )
++    .await?;
++
++    // Clean up the result text
++    let trimmed = result.trim();
++    let content = if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
++        &trimmed[1..trimmed.len() - 1]
++    } else {
++        trimmed
++    };
++
++    let content = content.replace("\\n", "\n");
++
++    // Write to file if output is specified
++    if let Some(output_path) = output {
++        if let Some(parent) = Path::new(&output_path).parent() {
++            std::fs::create_dir_all(parent)
++                .map_err(|e| anyhow!("Failed to create directories for {}: {}", output_path, e))?;
++        }
++        std::fs::write(&output_path, &content)
++            .map_err(|e| anyhow!("Failed to write result to file {}: {}", output_path, e))?;
++        eprintln!("\nResults written to: {}", output_path);
++    }
++
++    // Print to stdout
++    println!("\n{}", content);
++
++    Ok(())
++}
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index 2636afc..03cc006 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -101,6 +101,7 @@ pub async fn submit_solution<P: AsRef<Path>>(
+     leaderboard: &str,
+     gpu: &str,
+     submission_mode: &str,
++    on_log: Option<Box<dyn Fn(String) + Send + Sync>>,
+ ) -> Result<String> {
+     let base_url =
+         env::var("POPCORN_API_URL").map_err(|_| anyhow!("POPCORN_API_URL is not set"))?;
+@@ -172,11 +173,62 @@ pub async fn submit_solution<P: AsRef<Path>>(
+ 
+                 if let (Some(event), Some(data)) = (event_type, data_json) {
+                     match event {
+-                        "status" => (),
++                        "status" => {
++                            if let Some(ref cb) = on_log {
++                                // Try to parse as JSON and extract "message" or just return raw data
++                                if let Ok(val) = serde_json::from_str::<Value>(data) {
++                                    if let Some(msg) = val.get("message").and_then(|m| m.as_str()) {
++                                        cb(msg.to_string());
++                                    } else {
++                                        cb(data.to_string());
++                                    }
++                                } else {
++                                    cb(data.to_string());
++                                }
++                            }
++                        }
+                         "result" => {
+                             let result_val: Value = serde_json::from_str(data)?;
+-                            let reports = result_val.get("reports").unwrap();
+-                            return Ok(reports.to_string());
++                            
++                            if let Some(ref cb) = on_log {
++                                // Handle "results" array
++                                if let Some(results_array) = result_val.get("results").and_then(|v| v.as_array()) {
++                                    for (i, result_item) in results_array.iter().enumerate() {
++                                        let mode_key = submission_mode.to_lowercase();
++                                        
++                                        if let Some(run_obj) = result_item.get("runs")
++                                            .and_then(|r| r.get(&mode_key))
++                                            .and_then(|t| t.get("run")) 
++                                        {
++                                            if let Some(stdout) = run_obj.get("stdout").and_then(|s| s.as_str()) {
++                                                if !stdout.is_empty() {
++                                                    cb(format!("STDOUT (Run {}):\n{}", i + 1, stdout));
++                                                }
++                                            }
++                                            // Also check stderr
++                                            if let Some(stderr) = run_obj.get("stderr").and_then(|s| s.as_str()) {
++                                                if !stderr.is_empty() {
++                                                    cb(format!("STDERR (Run {}):\n{}", i + 1, stderr));
++                                                }
++                                            }
++                                        }
++                                    }
++                                } else {
++                                    // Fallback for single object or different structure
++                                    if let Some(stdout) = result_val.get("stdout").and_then(|s| s.as_str()) {
++                                        if !stdout.is_empty() {
++                                            cb(format!("STDOUT:\n{}", stdout));
++                                        }
++                                    }
++                                }
++                            }
++
++                            if let Some(reports) = result_val.get("reports") {
++                                return Ok(reports.to_string());
++                            } else {
++                                // If no reports, return the whole result as a string
++                                return Ok(serde_json::to_string_pretty(&result_val)?);
++                            }
+                         }
+                         "error" => {
+                             let error_val: Value = serde_json::from_str(data)?;
+@@ -198,11 +250,11 @@ pub async fn submit_solution<P: AsRef<Path>>(
+                             return Err(anyhow!(error_msg));
+                         }
+                         _ => {
+-                            stderr
+-                                .write_all(
+-                                    format!("Ignoring unknown SSE event: {}\n", event).as_bytes(),
+-                                )
+-                                .await?;
++                            let msg = format!("Ignoring unknown SSE event: {}\n", event);
++                            if let Some(ref cb) = on_log {
++                                cb(msg.clone());
++                            }
++                            stderr.write_all(msg.as_bytes()).await?;
+                             stderr.flush().await?;
+                         }
+                     }
